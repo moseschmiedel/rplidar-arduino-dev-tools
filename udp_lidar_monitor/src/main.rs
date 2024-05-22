@@ -2,17 +2,14 @@ use std::{
     io::{self, ErrorKind},
     net::UdpSocket,
     ops::Deref,
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        Arc, RwLock,
-    },
+    sync::mpsc::{channel, Receiver, Sender},
     thread,
-    time::Duration,
 };
 
 use eframe::egui::{self, Event, Vec2};
 use egui::{Color32, Context, Pos2};
 
+const UDP_ADDRESS: &str = "192.168.4.2";
 const UDP_PORT: u32 = 3333;
 
 #[derive(Debug, Clone)]
@@ -24,111 +21,69 @@ struct LidarPacket {
     scan_complete: bool,
 }
 
-#[derive(Debug, Clone)]
-enum State {
-    Startup,
-    RequestUDPConnect { address: String },
-    FailedUDPConnect,
-    SuccessfulUDPConnect,
-}
-
-impl State {
-    fn io_handle(&self, next_state: Self) -> Self {
-        match self {
-            Self::RequestUDPConnect { address: _ } => next_state,
-            _ => self.clone(),
-        }
-    }
-
-    fn io_has_message(&self) -> bool {
-        match self {
-            Self::RequestUDPConnect { address: _ } => true,
-            _ => false,
-        }
-    }
-
-    fn ui_handle(&self, next_state: Self) -> Self {
-        match self {
-            Self::Startup | Self::FailedUDPConnect | Self::SuccessfulUDPConnect => next_state,
-            _ => self.clone(),
-        }
-    }
-    fn ui_has_message(&self) -> bool {
-        match self {
-            Self::Startup | Self::FailedUDPConnect | Self::SuccessfulUDPConnect => true,
-            _ => false,
-        }
-    }
-
-    fn is(&self, other_state: Self) -> bool {
-        match self {
-            Self::Startup => match other_state {
-                Self::Startup => true,
-                _ => false,
-            },
-            Self::RequestUDPConnect { address: _ } => match other_state {
-                Self::RequestUDPConnect { address: _ } => true,
-                _ => false,
-            },
-            Self::SuccessfulUDPConnect => match other_state {
-                Self::SuccessfulUDPConnect => true,
-                _ => false,
-            },
-            Self::FailedUDPConnect => match other_state {
-                Self::FailedUDPConnect => true,
-                _ => false,
-            },
-        }
-    }
-}
-
-impl Default for State {
-    fn default() -> Self {
-        State::Startup
-    }
-}
-
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions::default();
-    let mut state = Arc::new(RwLock::new(State::default()));
-    let io_state = state.clone();
-    let ui_state = state.clone();
     eframe::run_native(
         "serial-plotter",
         options,
         Box::new(|cc| {
-            let (pp_sender, pp_receiver): (Sender<LidarPacket>, Receiver<LidarPacket>) = channel();
+            let (packet_sender, packet_receiver): (Sender<LidarPacket>, Receiver<LidarPacket>) =
+                channel();
+            let (reconnect_sender, reconnect_receiver): (
+                Sender<ConnectionData>,
+                Receiver<ConnectionData>,
+            ) = channel();
             let ctx = cc.egui_ctx.clone();
-            let _io_thread = thread::spawn(move || run_io(io_state, ctx, pp_sender));
-            Box::<Plot>::new(Plot::new(ui_state, pp_receiver))
+            let _io_thread = thread::spawn(move || {
+                run_io(
+                    ConnectionData::new(UDP_ADDRESS, UDP_PORT),
+                    ctx,
+                    packet_sender,
+                    reconnect_receiver,
+                )
+            });
+            Box::<Plot>::new(Plot::new(packet_receiver, reconnect_sender))
         }),
     )
 }
 
-fn run_io(state: Arc<RwLock<State>>, ctx: Context, sender: Sender<LidarPacket>) {
-    match UdpDecoder::new(format!("192.168.4.2:{UDP_PORT}")) {
-        Ok(decoder) => {
-            {
-                let mut state_handle = state.write().unwrap();
-                *state_handle = state_handle.io_handle(State::SuccessfulUDPConnect).into();
-            }
-            loop {
-                if let Ok(lidar_packet) = decoder.recv() {
-                    let _ = sender.send(lidar_packet);
-                    ctx.request_repaint();
-                }
-            }
+struct ConnectionData {
+    address: String,
+    port: u32,
+}
+
+impl ConnectionData {
+    fn new<S: AsRef<str>>(address: S, port: u32) -> Self {
+        Self {
+            address: String::from(address.as_ref()),
+            port,
         }
-        Err(_) => {
-            let mut state_handle = state.write().unwrap();
-            *state_handle = state_handle.io_handle(State::FailedUDPConnect).into();
-            drop(state_handle);
-            while !state.read().unwrap().io_has_message() {
-                thread::sleep(Duration::from_millis(10));
+    }
+}
+
+impl From<ConnectionData> for String {
+    fn from(connection_data: ConnectionData) -> Self {
+        return format!("{}:{}", connection_data.address, connection_data.port);
+    }
+}
+
+fn run_io(
+    connection_data: ConnectionData,
+    ctx: Context,
+    packet_sender: Sender<LidarPacket>,
+    reconnect_receiver: Receiver<ConnectionData>,
+) {
+    match UdpDecoder::new(String::from(connection_data)) {
+        Ok(decoder) => loop {
+            if let Ok(lidar_packet) = decoder.recv() {
+                let _ = packet_sender.send(lidar_packet);
+                ctx.request_repaint();
             }
-            if state.read().unwrap().is(State::RequestUDPConnect {
-                address: String::new(),
-            }) {}
+        },
+        Err(_) => {
+            if let Ok(reconnect_data) = reconnect_receiver.recv() {
+                run_io(reconnect_data, ctx, packet_sender, reconnect_receiver)
+            }
         }
     }
 }
@@ -255,17 +210,20 @@ impl Into<Vec<[f64; 2]>> for PlotData {
 }
 
 struct Plot {
-    state: Arc<RwLock<State>>,
-    in_channel: Receiver<LidarPacket>,
+    packet_receiver: Receiver<LidarPacket>,
+    reconnect_sender: Sender<ConnectionData>,
     plot_points: PlotData,
     zoom_factor: Vec2,
 }
 
 impl Plot {
-    fn new(state: Arc<RwLock<State>>, in_channel: Receiver<LidarPacket>) -> Plot {
+    fn new(
+        packet_receiver: Receiver<LidarPacket>,
+        reconnect_sender: Sender<ConnectionData>,
+    ) -> Plot {
         Self {
-            state,
-            in_channel,
+            packet_receiver,
+            reconnect_sender,
             plot_points: PlotData::new(),
             zoom_factor: Vec2::new(10.0, 10.0),
         }
@@ -274,7 +232,7 @@ impl Plot {
 
 impl eframe::App for Plot {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        while let Ok(lidar_packet) = self.in_channel.try_recv() {
+        while let Ok(lidar_packet) = self.packet_receiver.try_recv() {
             self.plot_points.push(
                 lidar_packet.idx,
                 lidar_packet.angle as f64,
