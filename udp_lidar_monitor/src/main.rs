@@ -7,7 +7,7 @@ use std::{
 };
 
 use eframe::egui::{self, Event, Vec2};
-use egui::{Color32, Context, Pos2};
+use egui::{debug_text::print, Color32, Context, Pos2};
 
 mod parsers;
 
@@ -63,6 +63,7 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
+#[derive(Debug, Clone)]
 struct ConnectionData {
     address: String,
     port: String,
@@ -107,6 +108,7 @@ fn run_io(
                 .send(ConnectionState::FailedConnection)
                 .expect("Channel<ConnectionState> already closed.");
             if let Ok(reconnect_data) = reconnect_receiver.recv() {
+                println!("Trying to reconnect...");
                 run_io(
                     reconnect_data,
                     ctx,
@@ -246,6 +248,8 @@ struct Plot {
     connection_state_receiver: Receiver<ConnectionState>,
     last_connection_state: ConnectionState,
     connection_data: ConnectionData,
+    address_ok: bool,
+    port_ok: bool,
     plot_points: PlotData,
     zoom_factor: Vec2,
 }
@@ -266,6 +270,8 @@ impl Plot {
             connection_state_receiver,
             last_connection_state,
             connection_data,
+            address_ok: true,
+            port_ok: true,
             plot_points: PlotData::new(),
             zoom_factor: Vec2::new(10.0, 10.0),
         }
@@ -274,6 +280,9 @@ impl Plot {
 
 impl eframe::App for Plot {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Ok(connection_state) = self.connection_state_receiver.try_recv() {
+            self.last_connection_state = connection_state;
+        }
         match self.last_connection_state {
             ConnectionState::SuccessfulConnection => self.update_lidar_map(ctx, frame),
             ConnectionState::FailedConnection => self.update_failed_connection(ctx, frame),
@@ -332,12 +341,44 @@ impl Plot {
     }
     fn ui_reconnect(&mut self, ui: &mut egui::Ui) {
         ui.label("UDP Address");
-        let address_response = ui.add(egui::TextEdit::singleline(&mut self.connection_data.address));
+        let mut address_text_edit = egui::TextEdit::singleline(&mut self.connection_data.address);
+        if !self.address_ok {
+            address_text_edit = address_text_edit.text_color(Color32::from_rgb(255, 0, 0));
+        }
+        let address_response = ui.add(address_text_edit);
         if address_response.changed() {
-            if self.connection_data.address.
+            match parsers::parse_udp_address(&self.connection_data.address) {
+                Ok(_) => {
+                    self.address_ok = true;
+                }
+                Err(_) => self.address_ok = false,
+            }
         }
 
         ui.label("UDP Port");
-        let port_response = ui.add(egui::TextEdit::singleline(&mut self.connection_data.port));
+        let mut port_text_edit = egui::TextEdit::singleline(&mut self.connection_data.port);
+        if !self.port_ok {
+            port_text_edit = port_text_edit.text_color(Color32::from_rgb(255, 0, 0));
+        }
+        let port_response = ui.add(port_text_edit);
+        if port_response.changed() {
+            match parsers::parse_udp_port(&self.connection_data.port) {
+                Ok(_) => {
+                    self.port_ok = true;
+                }
+                Err(_) => self.port_ok = false,
+            }
+        }
+
+        if !self.address_ok || !self.port_ok {
+            let button = egui::Button::new("Try reconnect");
+            ui.add_enabled(false, button);
+        } else {
+            if ui.button("Try reconnect").clicked() {
+                self.reconnect_sender
+                    .send(self.connection_data.clone())
+                    .expect("Channel<ConnectionData> already closed!");
+            }
+        }
     }
 }

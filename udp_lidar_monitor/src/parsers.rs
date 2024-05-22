@@ -33,13 +33,13 @@ fn parse_u8(input: &str) -> IResult<&str, u8> {
     map_res(take_while_m_n(3, 3, is_digit), u8_from_dec).parse(input)
 }
 
-fn parse_udp_address(input: &str) -> IResult<&str, UDPAddress> {
+pub fn parse_udp_address(input: &str) -> IResult<&str, UDPAddress> {
     let (input, (a, _, b, _, c, _, d)) =
         (u8, tag("."), u8, tag("."), u8, tag("."), u8).parse(input)?;
     Ok((input, UDPAddress { a, b, c, d }))
 }
-fn parse_udp_port(input: &str) -> IResult<&str, UDPPort> {
-    let (input, port) = u32(input)?;
+pub fn parse_udp_port(input: &str) -> IResult<&str, UDPPort> {
+    let (input, port) = map_res(take_while_m_n(1, 5, is_digit), u32_from_dec).parse(input)?;
     if port > 10000 {
         return Err(nom::Err::Failure(Error::new(
             input,
