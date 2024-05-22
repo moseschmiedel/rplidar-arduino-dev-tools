@@ -9,8 +9,10 @@ use std::{
 use eframe::egui::{self, Event, Vec2};
 use egui::{Color32, Context, Pos2};
 
+mod parsers;
+
 const UDP_ADDRESS: &str = "192.168.4.2";
-const UDP_PORT: u32 = 3333;
+const UDP_PORT: &str = "3333";
 
 #[derive(Debug, Clone)]
 struct LidarPacket {
@@ -21,6 +23,11 @@ struct LidarPacket {
     scan_complete: bool,
 }
 
+enum ConnectionState {
+    SuccessfulConnection,
+    FailedConnection,
+}
+
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions::default();
     eframe::run_native(
@@ -29,6 +36,10 @@ fn main() -> Result<(), eframe::Error> {
         Box::new(|cc| {
             let (packet_sender, packet_receiver): (Sender<LidarPacket>, Receiver<LidarPacket>) =
                 channel();
+            let (connection_state_sender, connection_state_receiver): (
+                Sender<ConnectionState>,
+                Receiver<ConnectionState>,
+            ) = channel();
             let (reconnect_sender, reconnect_receiver): (
                 Sender<ConnectionData>,
                 Receiver<ConnectionData>,
@@ -40,23 +51,28 @@ fn main() -> Result<(), eframe::Error> {
                     ctx,
                     packet_sender,
                     reconnect_receiver,
+                    connection_state_sender,
                 )
             });
-            Box::<Plot>::new(Plot::new(packet_receiver, reconnect_sender))
+            Box::<Plot>::new(Plot::new(
+                packet_receiver,
+                reconnect_sender,
+                connection_state_receiver,
+            ))
         }),
     )
 }
 
 struct ConnectionData {
     address: String,
-    port: u32,
+    port: String,
 }
 
 impl ConnectionData {
-    fn new<S: AsRef<str>>(address: S, port: u32) -> Self {
+    fn new<S: AsRef<str>>(address: S, port: S) -> Self {
         Self {
             address: String::from(address.as_ref()),
-            port,
+            port: String::from(port.as_ref()),
         }
     }
 }
@@ -72,17 +88,32 @@ fn run_io(
     ctx: Context,
     packet_sender: Sender<LidarPacket>,
     reconnect_receiver: Receiver<ConnectionData>,
+    connection_state_sender: Sender<ConnectionState>,
 ) {
     match UdpDecoder::new(String::from(connection_data)) {
-        Ok(decoder) => loop {
-            if let Ok(lidar_packet) = decoder.recv() {
-                let _ = packet_sender.send(lidar_packet);
-                ctx.request_repaint();
+        Ok(decoder) => {
+            connection_state_sender
+                .send(ConnectionState::SuccessfulConnection)
+                .expect("Channel<ConnectionState> already closed.");
+            loop {
+                if let Ok(lidar_packet) = decoder.recv() {
+                    let _ = packet_sender.send(lidar_packet);
+                    ctx.request_repaint();
+                }
             }
-        },
+        }
         Err(_) => {
+            connection_state_sender
+                .send(ConnectionState::FailedConnection)
+                .expect("Channel<ConnectionState> already closed.");
             if let Ok(reconnect_data) = reconnect_receiver.recv() {
-                run_io(reconnect_data, ctx, packet_sender, reconnect_receiver)
+                run_io(
+                    reconnect_data,
+                    ctx,
+                    packet_sender,
+                    reconnect_receiver,
+                    connection_state_sender,
+                )
             }
         }
     }
@@ -212,6 +243,9 @@ impl Into<Vec<[f64; 2]>> for PlotData {
 struct Plot {
     packet_receiver: Receiver<LidarPacket>,
     reconnect_sender: Sender<ConnectionData>,
+    connection_state_receiver: Receiver<ConnectionState>,
+    last_connection_state: ConnectionState,
+    connection_data: ConnectionData,
     plot_points: PlotData,
     zoom_factor: Vec2,
 }
@@ -220,10 +254,18 @@ impl Plot {
     fn new(
         packet_receiver: Receiver<LidarPacket>,
         reconnect_sender: Sender<ConnectionData>,
+        connection_state_receiver: Receiver<ConnectionState>,
     ) -> Plot {
+        let last_connection_state = connection_state_receiver
+            .recv()
+            .expect("Channel<ConnectionState> hung up!");
+        let connection_data = ConnectionData::new(UDP_ADDRESS, UDP_PORT);
         Self {
             packet_receiver,
             reconnect_sender,
+            connection_state_receiver,
+            last_connection_state,
+            connection_data,
             plot_points: PlotData::new(),
             zoom_factor: Vec2::new(10.0, 10.0),
         }
@@ -231,7 +273,16 @@ impl Plot {
 }
 
 impl eframe::App for Plot {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        match self.last_connection_state {
+            ConnectionState::SuccessfulConnection => self.update_lidar_map(ctx, frame),
+            ConnectionState::FailedConnection => self.update_failed_connection(ctx, frame),
+        }
+    }
+}
+
+impl Plot {
+    fn update_lidar_map(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         while let Ok(lidar_packet) = self.packet_receiver.try_recv() {
             self.plot_points.push(
                 lidar_packet.idx,
@@ -240,39 +291,53 @@ impl eframe::App for Plot {
                 lidar_packet.quality,
             );
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let (scroll, _, _) = ui.input(|i| {
-                let scroll = i.events.iter().find_map(|e| match e {
-                    Event::MouseWheel {
-                        unit: _,
-                        delta,
-                        modifiers: _,
-                    } => Some(*delta),
-                    _ => None,
-                });
-                (scroll, i.pointer.primary_down(), i.modifiers)
+        egui::CentralPanel::default().show(ctx, |ui| self.ui_lidar_map(ui));
+    }
+    fn ui_lidar_map(&mut self, ui: &mut egui::Ui) {
+        let (scroll, _, _) = ui.input(|i| {
+            let scroll = i.events.iter().find_map(|e| match e {
+                Event::MouseWheel {
+                    unit: _,
+                    delta,
+                    modifiers: _,
+                } => Some(*delta),
+                _ => None,
             });
-
-            if let Some(mut scroll) = scroll {
-                scroll = Vec2::splat(scroll.x + scroll.y);
-                self.zoom_factor.x *= (scroll.x / 10.0).exp();
-                self.zoom_factor.y *= (scroll.x / 10.0).exp();
-            }
-
-            let painter = ui.painter();
-            let clip_rect = painter.clip_rect();
-            let mid_x = (clip_rect.max.x - clip_rect.min.x) / 2.0;
-            let mid_y = (clip_rect.max.y - clip_rect.min.y) / 2.0;
-            for point in &self.plot_points {
-                painter.circle_filled(
-                    Pos2::new(
-                        mid_x + (point.x as f32 / self.zoom_factor.x),
-                        mid_y + (point.y as f32 / self.zoom_factor.y),
-                    ),
-                    2.0,
-                    point.color,
-                );
-            }
+            (scroll, i.pointer.primary_down(), i.modifiers)
         });
+
+        if let Some(mut scroll) = scroll {
+            scroll = Vec2::splat(scroll.x + scroll.y);
+            self.zoom_factor.x *= (scroll.x / 10.0).exp();
+            self.zoom_factor.y *= (scroll.x / 10.0).exp();
+        }
+
+        let painter = ui.painter();
+        let clip_rect = painter.clip_rect();
+        let mid_x = (clip_rect.max.x - clip_rect.min.x) / 2.0;
+        let mid_y = (clip_rect.max.y - clip_rect.min.y) / 2.0;
+        for point in &self.plot_points {
+            painter.circle_filled(
+                Pos2::new(
+                    mid_x + (point.x as f32 / self.zoom_factor.x),
+                    mid_y + (point.y as f32 / self.zoom_factor.y),
+                ),
+                2.0,
+                point.color,
+            );
+        }
+    }
+    fn update_failed_connection(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| self.ui_reconnect(ui));
+    }
+    fn ui_reconnect(&mut self, ui: &mut egui::Ui) {
+        ui.label("UDP Address");
+        let address_response = ui.add(egui::TextEdit::singleline(&mut self.connection_data.address));
+        if address_response.changed() {
+            if self.connection_data.address.
+        }
+
+        ui.label("UDP Port");
+        let port_response = ui.add(egui::TextEdit::singleline(&mut self.connection_data.port));
     }
 }
